@@ -48,7 +48,8 @@ class MetricGenerator(ABC):
             min_value: float,
             max_value: float,
             unit: str = "",
-            volatility: float = 0.1
+            volatility: float = 0.1,
+            pattern_config=None          # YENİ: PatternConfig referansı
     ):
         """
         MetricGenerator sınıfını başlatır.
@@ -60,6 +61,7 @@ class MetricGenerator(ABC):
             max_value: Maksimum değer (metrik bu değerin üstüne çıkamaz)
             unit: Birim (görüntüleme amaçlı)
             volatility: Değişkenlik katsayısı (0.0 = stabil, 1.0 = çok değişken)
+            pattern_config: PatternConfig instance (opsiyonel, pattern generators için)
         """
         self.name = name
         self.base_value = base_value
@@ -67,10 +69,46 @@ class MetricGenerator(ABC):
         self.max_value = max_value
         self.unit = unit
         self.volatility = volatility
+        self.pattern_config = pattern_config     # YENİ
 
         # Dahili durum - trend takibi için
         self._current_trend_offset = 0.0
         self._trend_change_rate = 0.0
+
+        # YENİ: Pattern generator referansları (dışarıdan inject edilebilir)
+        # None ise alt sınıflardaki basit sinüs fallback'i kullanılır
+        self._diurnal_pattern = None
+        self._weekly_pattern = None
+        self._noise_generator = None
+
+    # ==================== YENİ METOD ====================
+    def set_pattern_generators(self, diurnal=None, weekly=None, noise=None):
+        """
+        Gelişmiş pattern generator'ları inject eder.
+
+        Bu metod, basit sinüs tabanlı pattern yerine
+        PatternConfig parametrelerini kullanan gerçekçi
+        generator'lar bağlamak için kullanılır.
+
+        Eğer çağrılmazsa, alt sınıflardaki orijinal basit
+        pattern implementasyonları kullanılmaya devam eder.
+
+        Args:
+            diurnal: DiurnalPattern instance (günlük döngü)
+            weekly: WeeklyPattern instance (haftalık döngü)
+            noise: NoiseGenerator instance (gelişmiş gürültü)
+
+        Kullanım:
+            metric.set_pattern_generators(
+                diurnal=DiurnalPattern.from_config(pattern_config),
+                weekly=WeeklyPattern.from_config(pattern_config),
+                noise=NoiseGenerator.from_quality_level("medium")
+            )
+        """
+        self._diurnal_pattern = diurnal
+        self._weekly_pattern = weekly
+        self._noise_generator = noise
+    # ====================================================
 
     def generate(
             self,
@@ -125,17 +163,12 @@ class MetricGenerator(ABC):
         Trend, bir metriğin uzun vadeli yavaş artış veya azalış eğilimidir.
         Örneğin, bir sunucuda disk kullanımı zamanla yavaşça artabilir.
 
-        Trend değişimi düzgün (smooth) olmalıdır - ani sıçramalar olmamalı.
-        Bu yüzden trend_change_rate kullanarak yavaş değişim sağlıyoruz.
-
         Args:
             timestamp: Mevcut zaman damgası
 
         Returns:
             Trend etkisi (pozitif veya negatif bir offset)
         """
-        # Basit implementasyon: Şimdilik sabit trend
-        # Gelişmiş versiyonda, zamanla değişen dinamik trendler eklenebilir
         return self._current_trend_offset
 
     @abstractmethod
@@ -158,35 +191,34 @@ class MetricGenerator(ABC):
         """
         pass
 
+    # ==================== GÜNCELLENEN METOD ====================
     def _add_noise(self) -> float:
         """
         Metriğe gerçekçi rastgele gürültü ekler.
 
-        Gerçek dünyada hiçbir metrik tam sabit kalmaz. Küçük dalgalanmalar
-        vardır. Bu gürültü, metriğin volatility değerine göre ölçeklenir.
-
-        Gaussian (normal) dağılım kullanıyoruz çünkü doğal değişkenlikler
-        genellikle bu dağılıma uyar.
+        Eğer gelişmiş NoiseGenerator inject edilmişse onu kullanır
+        (Gaussian + micro-burst + Brownian drift).
+        Yoksa orijinal basit Gaussian noise'a fallback yapar.
 
         Returns:
             Rastgele gürültü değeri
         """
-        # Standart sapma, base_value ve volatility'ye göre ölçeklenir
+        # Gelişmiş noise generator varsa onu kullan
+        if self._noise_generator is not None:
+            return self._noise_generator.generate(
+                base_value=self.base_value,
+                volatility=self.volatility
+            )
+
+        # Fallback: orijinal basit Gaussian noise
         std_dev = self.base_value * self.volatility * 0.1
-
-        # Normal dağılımdan rastgele değer
         noise = np.random.normal(0, std_dev)
-
         return noise
+    # ===========================================================
 
     def _apply_correlation_effects(self, effects: Dict[str, float]) -> float:
         """
         Diğer metriklerden gelen korelasyon etkilerini toplar.
-
-        Metrikler birbirini etkiler. Örneğin:
-        - Yüksek CPU kullanımı → artan context switch sayısı
-        - Yüksek memory kullanımı → artan page fault oranı
-        - Yüksek disk I/O → artan %iowait
 
         Args:
             effects: Metrik adı -> etki miktarı dictionary'si
@@ -201,11 +233,6 @@ class MetricGenerator(ABC):
         """
         Değeri belirlenen minimum ve maksimum sınırlar içinde tutar.
 
-        Metrikler fiziksel sınırlara sahiptir:
-        - CPU %: 0-100 arasında
-        - Memory kullanımı: 0 ile toplam RAM arasında
-        - Disk I/O: Fiziksel disk hızı ile sınırlı
-
         Args:
             value: Sınırlanacak değer
 
@@ -218,10 +245,6 @@ class MetricGenerator(ABC):
         """
         Metriğin trend parametrelerini ayarlar.
 
-        Bu metod, metriğin zamanla nasıl değişeceğini kontrol etmek için
-        kullanılır. Örneğin, bir sunucuda disk doluluk oranının artmasını
-        simüle etmek için pozitif bir trend offset verilebilir.
-
         Args:
             trend_offset: Mevcut trend offseti
             change_rate: Trend'in değişim hızı (her adımda ne kadar değişeceği)
@@ -232,9 +255,6 @@ class MetricGenerator(ABC):
     def update_trend(self):
         """
         Trend'i bir adım ilerletir.
-
-        Her zaman adımında, trend yavaşça değişebilir. Bu metod, trend'in
-        change_rate parametresine göre güncellenmesini sağlar.
         """
         self._current_trend_offset += self._trend_change_rate
 
@@ -256,6 +276,13 @@ class MetricGenerator(ABC):
         }
 
 
+# ============================================================
+# GÜNCELLENEN ALT SINIFLAR
+# Her birinin __init__'ine pattern_config parametresi eklendi
+# ve _apply_temporal_patterns metodları gelişmiş pattern
+# generator desteği ile güncellendi
+# ============================================================
+
 class PercentageMetric(MetricGenerator):
     """
     Yüzde bazlı metrikler için özelleştirilmiş sınıf.
@@ -270,7 +297,8 @@ class PercentageMetric(MetricGenerator):
             self,
             name: str,
             base_value: float,
-            volatility: float = 0.1
+            volatility: float = 0.1,
+            pattern_config=None          # YENİ parametre
     ):
         """
         Yüzde metriği oluşturur.
@@ -279,6 +307,7 @@ class PercentageMetric(MetricGenerator):
             name: Metrik adı
             base_value: Temel yüzde değeri (0-100)
             volatility: Değişkenlik katsayısı
+            pattern_config: PatternConfig instance (opsiyonel)
         """
         super().__init__(
             name=name,
@@ -286,24 +315,39 @@ class PercentageMetric(MetricGenerator):
             min_value=0.0,
             max_value=100.0,
             unit="%",
-            volatility=volatility
+            volatility=volatility,
+            pattern_config=pattern_config    # YENİ: üst sınıfa ilet
         )
 
     def _apply_temporal_patterns(self, timestamp: datetime) -> float:
         """
-        Basit günlük desen: Gündüz artar, gece azalır.
+        Günlük ve haftalık desenleri uygular.
 
-        Bu basit implementasyon, saat bazlı sinüs dalgası kullanır.
-        Daha gerçekçi desenler için alt sınıflarda override edilebilir.
+        GÜNCELLENDİ: Eğer gelişmiş DiurnalPattern/WeeklyPattern inject
+        edilmişse onları kullanır. Yoksa orijinal basit sinüs'e fallback yapar.
         """
-        hour = timestamp.hour
+        total_effect = 0.0
 
-        # Sabah 9'da maksimum, gece 3'te minimum
-        # Sinüs fonksiyonu ile yumuşak geçiş
-        hour_offset = (hour - 9) * np.pi / 12
-        pattern_effect = np.sin(hour_offset) * self.base_value * 0.2
+        # Gelişmiş diurnal pattern varsa onu kullan
+        if self._diurnal_pattern is not None:
+            total_effect += self._diurnal_pattern.calculate(
+                timestamp=timestamp,
+                base_value=self.base_value
+            )
+        else:
+            # Fallback: orijinal basit sinüs
+            hour = timestamp.hour
+            hour_offset = (hour - 9) * np.pi / 12
+            total_effect += np.sin(hour_offset) * self.base_value * 0.2
 
-        return pattern_effect
+        # Gelişmiş weekly pattern varsa onu da ekle
+        if self._weekly_pattern is not None:
+            total_effect += self._weekly_pattern.calculate(
+                timestamp=timestamp,
+                base_value=self.base_value
+            )
+
+        return total_effect
 
 
 class CountMetric(MetricGenerator):
@@ -320,7 +364,8 @@ class CountMetric(MetricGenerator):
             base_value: float,
             max_value: float,
             unit: str = "count",
-            volatility: float = 0.15
+            volatility: float = 0.15,
+            pattern_config=None          # YENİ parametre
     ):
         super().__init__(
             name=name,
@@ -328,23 +373,38 @@ class CountMetric(MetricGenerator):
             min_value=0.0,
             max_value=max_value,
             unit=unit,
-            volatility=volatility
+            volatility=volatility,
+            pattern_config=pattern_config    # YENİ
         )
 
     def _apply_temporal_patterns(self, timestamp: datetime) -> float:
         """
         Sayısal metrikler için temporal pattern.
 
-        Genellikle iş yükü ile ilişkili, bu yüzden basit
-        günlük desen uyguluyoruz.
+        GÜNCELLENDİ: Gelişmiş pattern generator desteği eklendi.
         """
-        hour = timestamp.hour
+        total_effect = 0.0
 
-        # İş saatleri (9-17) daha yüksek
-        if 9 <= hour <= 17:
-            return self.base_value * 0.3
+        if self._diurnal_pattern is not None:
+            total_effect += self._diurnal_pattern.calculate(
+                timestamp=timestamp,
+                base_value=self.base_value
+            )
         else:
-            return -self.base_value * 0.2
+            # Fallback: orijinal basit pattern
+            hour = timestamp.hour
+            if 9 <= hour <= 17:
+                total_effect = self.base_value * 0.3
+            else:
+                total_effect = -self.base_value * 0.2
+
+        if self._weekly_pattern is not None:
+            total_effect += self._weekly_pattern.calculate(
+                timestamp=timestamp,
+                base_value=self.base_value
+            )
+
+        return total_effect
 
 
 class ThroughputMetric(MetricGenerator):
@@ -360,7 +420,8 @@ class ThroughputMetric(MetricGenerator):
             base_value: float,
             max_value: float,
             unit: str = "KB/s",
-            volatility: float = 0.2
+            volatility: float = 0.2,
+            pattern_config=None          # YENİ parametre
     ):
         super().__init__(
             name=name,
@@ -368,24 +429,36 @@ class ThroughputMetric(MetricGenerator):
             min_value=0.0,
             max_value=max_value,
             unit=unit,
-            volatility=volatility
+            volatility=volatility,
+            pattern_config=pattern_config    # YENİ
         )
 
     def _apply_temporal_patterns(self, timestamp: datetime) -> float:
         """
         Throughput metrikleri için pattern.
 
-        Network ve disk I/O genellikle burst (patlama) şeklinde
-        gelir, o yüzden daha yüksek volatility kullanıyoruz.
+        GÜNCELLENDİ: Gelişmiş pattern generator desteği eklendi.
         """
-        hour = timestamp.hour
-        weekday = timestamp.weekday()
+        total_effect = 0.0
 
-        # Hafta içi vs hafta sonu farkı
-        weekday_factor = 1.0 if weekday < 5 else 0.6
+        if self._diurnal_pattern is not None:
+            total_effect += self._diurnal_pattern.calculate(
+                timestamp=timestamp,
+                base_value=self.base_value
+            )
+        else:
+            # Fallback: orijinal basit pattern
+            hour = timestamp.hour
+            weekday = timestamp.weekday()
+            weekday_factor = 1.0 if weekday < 5 else 0.6
+            hour_offset = (hour - 14) * np.pi / 12
+            hour_pattern = np.sin(hour_offset) * 0.3
+            total_effect = self.base_value * weekday_factor * hour_pattern
 
-        # Gündüz vs gece farkı
-        hour_offset = (hour - 14) * np.pi / 12
-        hour_pattern = np.sin(hour_offset) * 0.3
+        if self._weekly_pattern is not None:
+            total_effect += self._weekly_pattern.calculate(
+                timestamp=timestamp,
+                base_value=self.base_value
+            )
 
-        return self.base_value * weekday_factor * hour_pattern
+        return total_effect
